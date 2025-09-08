@@ -1,28 +1,33 @@
 import streamlit as st
 import os
-import io
+import asyncio
 from dotenv import load_dotenv
 from pypdf import PdfReader
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_cohere import ChatCohere
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
+# The following imports are for the new LCEL chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.output_parsers import StrOutputParser
 from langchain_cohere.rerank import CohereRerank
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.messages import AIMessage, HumanMessage
-import asyncio
 
 # Load environment variables
 load_dotenv()
 os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
 os.environ["COHERE_API_KEY"] = st.secrets["COHERE_API_KEY"]
 
-# Helper function to get or create an event loop
+# Helper function to get or create an event loop to fix the async runtime error
 def get_or_create_eventloop():
+    """
+    Retrieves the current event loop or creates a new one if it doesn't exist.
+    """
     try:
         return asyncio.get_running_loop()
     except RuntimeError:
@@ -30,9 +35,10 @@ def get_or_create_eventloop():
         asyncio.set_event_loop(loop)
         return loop
 
-# Caching for the model to speed up processing
+# Caching functions to speed up processing
 @st.cache_resource
 def get_pdf_text(pdf_docs):
+    """Extracts text from a list of PDF documents."""
     text = ""
     for pdf in pdf_docs:
         pdf_reader = PdfReader(pdf)
@@ -42,39 +48,50 @@ def get_pdf_text(pdf_docs):
 
 @st.cache_resource
 def get_text_chunks(text):
+    """Splits a long string of text into smaller, manageable chunks."""
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
     chunks = text_splitter.split_text(text)
     return chunks
 
 @st.cache_resource
 def get_vector_store(text_chunks):
-    # Ensure event loop exists for embeddings initialization
+    """
+    Creates and returns a FAISS vector store from text chunks.
+    Ensures an event loop exists for embeddings initialization.
+    """
     get_or_create_eventloop()
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
     return vector_store
 
 @st.cache_resource
-def get_conversational_chain():
+def get_rag_chain():
+    """
+    Builds and returns the complete RAG (Retrieval-Augmented Generation) chain.
+    This replaces the deprecated `load_qa_chain`.
+    """
+    # Define the LLM model and prompt template
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
     prompt_template = """
     Answer the user's question from the provided context only.
-    Context:\n {context}?\n
+    Context:\n {context}\n
     Question: {question}\n
 
     Answer:
     """
+    prompt = ChatPromptTemplate.from_template(prompt_template)
 
-    model = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
-    return chain
+    # This chain handles combining the retrieved documents with the prompt
+    document_chain = create_stuff_documents_chain(llm, prompt)
 
-# New function to run async code in a synchronous context
-def get_answer(user_question):
-    # Ensure event loop exists for ainvoke call
-    loop = get_or_create_eventloop()
-    response = loop.run_until_complete(st.session_state.chain.ainvoke({"input_documents": st.session_state.retriever.get_relevant_documents(user_question), "question": user_question}))
-    return response["output_text"]
+    # This is the full RAG chain using LangChain Expression Language (LCEL)
+    # It passes the question to the retriever and then the retrieved context to the document chain
+    rag_chain = (
+        {"context": RunnablePassthrough(), "question": RunnablePassthrough()}
+        | RunnableLambda(lambda x: {"context": x["context"].get_relevant_documents(x["question"]), "question": x["question"]})
+        | document_chain
+    )
+    return rag_chain
 
 # Main application logic
 def main():
@@ -98,14 +115,18 @@ def main():
                     raw_text = get_pdf_text(pdf_docs)
                     text_chunks = get_text_chunks(raw_text)
                     vector_store = get_vector_store(text_chunks)
-                    # FIX: Reduce k to prevent ResourceExhausted error
+                    
+                    # Create retriever and reranker
                     st.session_state.retriever = vector_store.as_retriever(search_kwargs={"k": 3})
                     cohere_rerank = CohereRerank(model="rerank-english-v3.0", top_n=3)
                     st.session_state.retriever = ContextualCompressionRetriever(
                         base_retriever=st.session_state.retriever,
                         base_compressor=cohere_rerank,
                     )
-                    st.session_state.chain = get_conversational_chain()
+                    
+                    # Store the new LCEL-based RAG chain in session state
+                    st.session_state.chain = get_rag_chain()
+                    
                     st.success("Processing complete!")
             else:
                 st.error("Please upload a PDF file first!")
@@ -117,9 +138,16 @@ def main():
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                response = get_answer(user_question)
-                st.markdown(response)
-        st.session_state.messages.append({"role": "assistant", "content": response})
-
+                # Use the helper function to run the async chain call
+                loop = get_or_create_eventloop()
+                response_obj = loop.run_until_complete(st.session_state.chain.ainvoke({"context": st.session_state.retriever, "question": user_question}))
+                
+                # The response object from the new chain is different; extract the text
+                response_text = response_obj
+                
+            st.markdown(response_text)
+        st.session_state.messages.append({"role": "assistant", "content": response_text})
+        
 if __name__ == "__main__":
     main()
+
