@@ -84,14 +84,7 @@ def get_rag_chain():
     # This chain handles combining the retrieved documents with the prompt
     document_chain = create_stuff_documents_chain(llm, prompt)
 
-    # This is the full RAG chain using LangChain Expression Language (LCEL)
-    # It passes the question to the retriever and then the retrieved context to the document chain
-    rag_chain = (
-        {"context": RunnablePassthrough(), "question": RunnablePassthrough()}
-        | RunnableLambda(lambda x: {"context": x["context"].get_relevant_documents(x["question"]), "question": x["question"]})
-        | document_chain
-    )
-    return rag_chain
+    return document_chain
 
 # Main application logic
 def main():
@@ -132,22 +125,37 @@ def main():
                 st.error("Please upload a PDF file first!")
 
     if user_question := st.chat_input("Ask a question about your PDF:"):
+        # Check if chain and retriever exist
+        if "chain" not in st.session_state or "retriever" not in st.session_state:
+            st.error("Please upload and process a PDF file first!")
+            return
+            
         st.session_state.messages.append({"role": "user", "content": user_question})
         with st.chat_message("user"):
             st.markdown(user_question)
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                # Use the helper function to run the async chain call
-                loop = get_or_create_eventloop()
-                response_obj = loop.run_until_complete(st.session_state.chain.ainvoke({"context": st.session_state.retriever, "question": user_question}))
-                
-                # The response object from the new chain is different; extract the text
-                response_text = response_obj
+                try:
+                    # First retrieve the relevant documents
+                    retrieved_docs = st.session_state.retriever.get_relevant_documents(user_question)
+                    
+                    # Then invoke the chain with the retrieved documents and question
+                    response_text = st.session_state.chain.invoke({
+                        "context": retrieved_docs, 
+                        "question": user_question
+                    })
+                except Exception as e:
+                    st.error(f"An error occurred: {str(e)}")
+                    return
                 
             st.markdown(response_text)
         st.session_state.messages.append({"role": "assistant", "content": response_text})
+
+    # Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
         
 if __name__ == "__main__":
     main()
-
