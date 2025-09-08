@@ -14,6 +14,7 @@ from langchain.retrievers import ContextualCompressionRetriever
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.messages import AIMessage, HumanMessage
+from google.api_core.exceptions import ResourceExhausted # New Import for error handling
 
 # Load environment variables
 load_dotenv()
@@ -38,17 +39,23 @@ def get_text_chunks(text):
 
 @st.cache_resource
 def get_vector_store(text_chunks):
-    embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
     return vector_store
 
+@st.cache_resource
 def get_conversational_chain():
     prompt_template = """
-    Answer the question as detailed as possible from the provided context, make sure to provide all the details.
-    Do not add any additional information outside of the provided context. If the answer is not in the provided context,
-    just say, "Answer is not available in the context."\n\n
-    Context:\n {context}\n
-    Question:\n {question}\n
+    Answer the question as detailed as possible from the provided context, make sure to provide all the details,
+    if the answer is not in the provided context, just say, "The answer is not available in the context",
+    don't provide the wrong answer.
+
+    Context:
+    {context}
+
+    Question:
+    {question}
+
     Answer:
     """
     model = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0.3)
@@ -57,35 +64,36 @@ def get_conversational_chain():
     return chain
 
 def get_answer(user_question):
-    with st.spinner("Processing..."):
-        docs = st.session_state.retriever.get_relevant_documents(user_question)
-        response = st.session_state.chain.invoke({"input_documents": docs, "question": user_question})
-        return response["output_text"]
+    # Added a try...except block to handle potential API errors.
+    try:
+        with st.spinner("Processing..."):
+            docs = st.session_state.retriever.get_relevant_documents(user_question)
+            response = st.session_state.chain.invoke({"input_documents": docs, "question": user_question})
+            return response["output_text"]
+    except ResourceExhausted:
+        return "An API quota error occurred. Please try again in a moment or check your API usage limits."
+    except Exception as e:
+        return f"An unexpected error occurred: {e}"
 
 def main():
-    st.set_page_config(page_title="PDF Chatbot", page_icon="📚")
-    st.header("Chat with your PDF :books:")
-
-    # Initialize chat history in session state if it doesn't exist
     if "messages" not in st.session_state:
         st.session_state.messages = []
-
-    # Display chat messages from history on app rerun
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    
+    st.set_page_config(page_title="Chat with your PDF's", page_icon=":books:")
+    st.title("Chat with your PDF's :books:")
 
     with st.sidebar:
-        st.title("Settings")
         st.subheader("Your Documents")
-        pdf_docs = st.file_uploader("Upload your PDFs and click Process", type="pdf", accept_multiple_files=True)
+        pdf_docs = st.file_uploader(
+            "Upload your PDF files here and click on 'Process'",
+            accept_multiple_files=True
+        )
         if st.button("Process"):
             if pdf_docs:
                 with st.spinner("Processing..."):
                     raw_text = get_pdf_text(pdf_docs)
                     text_chunks = get_text_chunks(raw_text)
                     vector_store = get_vector_store(text_chunks)
-                    # FIX: Reduce k to prevent ResourceExhausted error
                     st.session_state.retriever = vector_store.as_retriever(search_kwargs={"k": 3})
                     cohere_rerank = CohereRerank(model="rerank-english-v3.0", top_n=3)
                     st.session_state.retriever = ContextualCompressionRetriever(
@@ -96,6 +104,10 @@ def main():
                     st.success("Processing complete!")
             else:
                 st.error("Please upload a PDF file first!")
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
     if user_question := st.chat_input("Ask a question about your PDF:"):
         st.session_state.messages.append({"role": "user", "content": user_question})
