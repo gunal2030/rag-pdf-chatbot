@@ -1,4 +1,5 @@
 Retrieval-Augmented Generation (RAG) Chatbot
+
 🚀 About the Project
 This project is an advanced chatbot built using a Retrieval-Augmented Generation (RAG) architecture. Unlike traditional chatbots that rely solely on pre-trained knowledge, this bot enhances its capabilities by retrieving information from an external knowledge base before generating a response. This approach ensures more accurate, up-to-date, and context-aware conversations, making the bot more reliable for specific domains or information.
 
